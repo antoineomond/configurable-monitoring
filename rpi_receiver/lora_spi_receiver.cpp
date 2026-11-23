@@ -1,13 +1,13 @@
 /*
- LoRa transmitter for a Raspberry Pi Zero W + SX1262, using RadioLib.
+ LoRa receiver for a Raspberry Pi Zero W + SX1262, using RadioLib.
 
- The radio settings mirror the ones used by lora_spi_receiver.c
- (see common.c and sx126x_driver/configuration/apps_configuration.h),
- so both ends can talk to each other.
+ The sender is a Pico 2 + SX1262 using the Semtech sx126x_driver. The radio
+ settings mirror the ones in common.c and
+ sx126x_driver/configuration/apps_configuration.h, so both ends can talk
+ to each other.
 
- The payload is a 4-byte little-endian uint32_t holding a temperature in
- hundredths of a degree, which is what the receiver decodes
- (value / 100.0). The Pi CPU temperature is used as the data source.
+ The payload is decoded as a sequence of 4-byte little-endian uint32_t, each
+ holding a temperature in hundredths of a degree (value / 100.0).
 */
 
 #include <stdio.h>
@@ -47,7 +47,7 @@
 #define LORA_RESET_PIN 22
 #endif
 
-// Radio configuration, must match lora_spi_receiver.c
+// Radio configuration, must match the Pico 2 sender (common.c)
 #ifndef FREQ_HZ
 #define FREQ_HZ 920000000
 #endif
@@ -75,9 +75,6 @@
 #ifndef LORA_SYNCWORD
 #define LORA_SYNCWORD 0x12 // private network, same as LORA_SYNCWORD_PRIVATE_NTW
 #endif
-#ifndef TX_OUTPUT_POWER_DBM
-#define TX_OUTPUT_POWER_DBM 14 // range [-9, +22]
-#endif
 
 // Board-specific settings of the SX1262 module
 #ifndef LORA_TCXO_VOLTAGE
@@ -87,14 +84,11 @@
 #define LORA_DIO2_AS_RF_SWITCH true
 #endif
 
-#ifndef PAYLOAD_LENGTH
-#define PAYLOAD_LENGTH 4
+#ifndef MAX_PAYLOAD_LENGTH
+#define MAX_PAYLOAD_LENGTH 255
 #endif
-#ifndef TX_PERIOD_MS
-#define TX_PERIOD_MS 1000
-#endif
-#ifndef CPU_TEMP_PATH
-#define CPU_TEMP_PATH "/sys/class/thermal/thermal_zone0/temp"
+#ifndef POLL_PERIOD_MS
+#define POLL_PERIOD_MS 10
 #endif
 
 #define CHECK_RADIOLIB(fc, fname)                                    \
@@ -109,19 +103,10 @@
 PiHal* hal = new PiHal(LORA_SPI_CHANNEL, LORA_SPI_SPEED_HZ);
 SX1262 radio = new Module(hal, LORA_NSS_PIN, LORA_DIO1_PIN, LORA_RESET_PIN, LORA_BUSY_PIN);
 
-// Returns the CPU temperature in hundredths of a degree Celsius
-bool read_cpu_temperature(uint32_t* temperature) {
-	FILE* f = fopen(CPU_TEMP_PATH, "r");
-	if(!f) {
-		return false;
-	}
-	long millideg;
-	bool ok = fscanf(f, "%ld", &millideg) == 1;
-	fclose(f);
-	if(ok) {
-		*temperature = (uint32_t)(millideg / 10);
-	}
-	return ok;
+// Set from the lgpio alert thread when DIO1 rises (RxDone)
+volatile bool received_msg = false;
+void dio1_callback(void) {
+	received_msg = true;
 }
 
 int main() {
@@ -133,7 +118,6 @@ int main() {
 	cfg.spreadingFactor = LORA_SPREADING_FACTOR;
 	cfg.codingRate      = LORA_CODING_RATE;
 	cfg.syncWord        = LORA_SYNCWORD;
-	cfg.power           = TX_OUTPUT_POWER_DBM;
 	cfg.preambleLength  = LORA_PREAMBLE_LENGTH;
 	printf("[SX1262] Initializing ... ");
 	CHECK_RADIOLIB(radio.begin(cfg), "begin");
@@ -152,30 +136,34 @@ int main() {
 	CHECK_RADIOLIB(radio.invertIQ(LORA_IQ_INVERTED), "invertIQ");
 	CHECK_RADIOLIB(radio.setSyncWord(LORA_SYNCWORD), "setSyncWord");
 	CHECK_RADIOLIB(radio.setDio2AsRfSwitch(LORA_DIO2_AS_RF_SWITCH), "setDio2AsRfSwitch");
-	CHECK_RADIOLIB(radio.setOutputPower(TX_OUTPUT_POWER_DBM), "setOutputPower");
 
-	uint8_t buffer[PAYLOAD_LENGTH];
-	uint32_t nb_msg_sent = 0;
+	// Continuous RX: the radio stays in RX after each RxDone
+	radio.setDio1Action(dio1_callback);
+	CHECK_RADIOLIB(radio.startReceive(), "startReceive");
+	printf("[SX1262] Listening on %.1f MHz ...\n", FREQ_HZ / 1e6);
+
+	uint8_t buffer[MAX_PAYLOAD_LENGTH];
+	uint32_t nb_msg_received = 0;
 	uint32_t temperature;
 	while(1) {
-		if(!read_cpu_temperature(&temperature)) {
-			fprintf(stderr, "could not read %s\n", CPU_TEMP_PATH);
-			temperature = 0;
+		if(received_msg) {
+			received_msg = false;
+			size_t len = radio.getPacketLength();
+			int16_t state = radio.readData(buffer, len);
+			if(state == RADIOLIB_ERR_NONE) {
+				nb_msg_received += 1;
+				// Little-endian, as written by the sender
+				for(size_t i = 0; i + 4 <= len; i += 4) {
+					temperature = buffer[i] | (buffer[i + 1] << 8) | (buffer[i + 2] << 16) | ((uint32_t)buffer[i + 3] << 24);
+					printf("%.2f,", temperature / 100.0);
+				}
+				printf("%" PRIu32 ",len=%zu,rssi=%.1f,snr=%.1f\n",
+				       nb_msg_received, len, radio.getRSSI(), radio.getSNR());
+			} else {
+				fprintf(stderr, "readData failed, code %d\n", state);
+			}
 		}
-		// Little-endian, as decoded by the receiver
-		buffer[0] = temperature & 0xFF;
-		buffer[1] = (temperature >> 8) & 0xFF;
-		buffer[2] = (temperature >> 16) & 0xFF;
-		buffer[3] = (temperature >> 24) & 0xFF;
-
-		int16_t state = radio.transmit(buffer, PAYLOAD_LENGTH);
-		if(state == RADIOLIB_ERR_NONE) {
-			nb_msg_sent += 1;
-			printf("sent %.2f, msg_sent: %" PRIu32 "\n", temperature / 100.0, nb_msg_sent);
-		} else {
-			fprintf(stderr, "transmit failed, code %d\n", state);
-		}
-		hal->delay(TX_PERIOD_MS);
+		hal->delay(POLL_PERIOD_MS);
 	}
 	return 0;
 }

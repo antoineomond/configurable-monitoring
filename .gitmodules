@@ -1,3 +1,8 @@
 [submodule "external/RadioLib"]
 	path = external/RadioLib
 	url = https://github.com/jgromes/RadioLib.git
+	# pinned to 8.0.0
+[submodule "external/pico-sdk"]
+	path = external/pico-sdk
+	url = https://github.com/raspberrypi/pico-sdk.git
+	# pinned to 2.3.0

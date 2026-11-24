@@ -35,7 +35,7 @@
 #define LORA_SPI_SPEED_HZ 2000000
 #endif
 #ifndef LORA_NSS_PIN
-#define LORA_NSS_PIN 8 // must match the CE line of LORA_SPI_CHANNEL
+#define LORA_NSS_PIN RADIOLIB_NC // must match the CE line of LORA_SPI_CHANNEL
 #endif
 #ifndef LORA_DIO1_PIN
 #define LORA_DIO1_PIN 17

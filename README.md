@@ -22,5 +22,5 @@ Get the serial number of the connected Pico 2 (idSerial):
 - `export SERIAL_NUMBER=<idSerial>`
 
 Flash (replace picotool by where you installed it on the machine):
-- `sudo ~/.local/bin/picotool-2.1.1-x86_64-lin/picotool load --ser $SERIAL_NUMBER -f -x lora_spi_transmitter.uf2`
+- `sudo ~/.local/bin/picotool-2.1.1-x86_64-lin/picotool/picotool load --ser $SERIAL_NUMBER -f -x lora_spi_transmitter.uf2`
 

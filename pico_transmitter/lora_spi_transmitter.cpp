@@ -1,23 +1,26 @@
 /*
  LoRa transmitter for a Raspberry Pi Pico 2 + SX1262, using RadioLib
- and its PicoHal.
+ and its PicoHal. The transmitted data is read from a BME680 connected in SPI,
+ using the Bosch BME68x_SensorAPI.
 
  The receiver is rpi_receiver/lora_spi_receiver.cpp (Pi Zero W). Both ends
  must use the same radio settings below.
 
- The payload is a 4-byte little-endian uint32_t holding the RP2350 on-chip
- temperature in hundredths of a degree, which is what the receiver decodes
- (value / 100.0).
+ The payload is a 4-byte little-endian uint32_t holding the BME680 temperature
+ in hundredths of a degree, which is what the receiver decodes (value / 100.0).
 */
 
 #include <stdio.h>
 #include <stdint.h>
+#include <math.h>
 
 #include <pico/stdlib.h>
-#include "hardware/adc.h"
+#include "hardware/spi.h"
 
 #include <RadioLib.h>
 #include "hal/RPiPico/PicoHal.h"
+
+#include "bme68x.h"
 
 /*
  Wiring (Pico 2 GPIO numbers, same as the previous sx126x_driver setup:
@@ -29,6 +32,12 @@
    SX1262 DIO1 -> GP20
    SX1262 BUSY -> GP8
    SX1262 NRST -> GP9
+
+ The BME680 shares SPI0 with the SX1262, with its own chip select:
+   BME680 SDO  -> GP16  SPI0 RX
+   BME680 CSB  -> GP5
+   BME680 SCK  -> GP18  SPI0 SCK
+   BME680 SDI  -> GP19  SPI0 TX
 */
 #ifndef LORA_SPI_PORT
 #define LORA_SPI_PORT spi0
@@ -56,6 +65,26 @@
 #endif
 #ifndef LORA_RESET_PIN
 #define LORA_RESET_PIN 9
+#endif
+
+// When the bus is shared with the radio, RadioLib's speed applies once it is initialized
+#ifndef BME_SPI_PORT
+#define BME_SPI_PORT LORA_SPI_PORT
+#endif
+#ifndef BME_SPI_SPEED_HZ
+#define BME_SPI_SPEED_HZ LORA_SPI_SPEED_HZ // max 10 MHz
+#endif
+#ifndef BME_MISO_PIN
+#define BME_MISO_PIN LORA_MISO_PIN
+#endif
+#ifndef BME_CS_PIN
+#define BME_CS_PIN 5
+#endif
+#ifndef BME_SCK_PIN
+#define BME_SCK_PIN LORA_SCK_PIN
+#endif
+#ifndef BME_MOSI_PIN
+#define BME_MOSI_PIN LORA_MOSI_PIN
 #endif
 
 // Radio configuration, must match the Pi Zero receiver
@@ -114,24 +143,103 @@
 		}                                                                \
 	}
 
+#define CHECK_BME(fc, fname)                                         \
+	{                                                                  \
+		int8_t rslt = (fc);                                              \
+		if(rslt != BME68X_OK) {                                          \
+			printf("%s failed, code %d\n", fname, rslt);                   \
+			return rslt;                                                   \
+		}                                                                \
+	}
+
 PicoHal* hal = new PicoHal(LORA_SPI_PORT, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_SCK_PIN, LORA_SPI_SPEED_HZ);
 SX1262 radio = new Module(hal, LORA_NSS_PIN, LORA_DIO1_PIN, LORA_RESET_PIN, LORA_BUSY_PIN);
 
-// Returns the on-chip temperature in hundredths of a degree Celsius
-uint32_t read_chip_temperature() {
-	const float conversion_factor = 3.3f / (1 << 12);
-	float voltage = adc_read() * conversion_factor;
-	float celsius = 27.0f - (voltage - 0.706f) / 0.001721f;
-	return (uint32_t)(int32_t)(celsius * 100.0f);
+struct bme68x_dev bme;
+struct bme68x_conf bme_conf;
+
+// SPI callbacks for the BME68x_SensorAPI, which already sets the read/write bit of
+// reg_addr and, for writes, interleaves the next register addresses in data
+int8_t bme_spi_read(uint8_t reg_addr, uint8_t* data, uint32_t len, void* intf_ptr) {
+	gpio_put(BME_CS_PIN, 0);
+	int nb_written = spi_write_blocking(BME_SPI_PORT, &reg_addr, 1);
+	int nb_read = spi_read_blocking(BME_SPI_PORT, 0x00, data, len);
+	gpio_put(BME_CS_PIN, 1);
+	return (nb_written == 1 && nb_read == (int)len) ? BME68X_INTF_RET_SUCCESS : BME68X_E_COM_FAIL;
+}
+
+int8_t bme_spi_write(uint8_t reg_addr, const uint8_t* data, uint32_t len, void* intf_ptr) {
+	gpio_put(BME_CS_PIN, 0);
+	int nb_written = spi_write_blocking(BME_SPI_PORT, &reg_addr, 1);
+	nb_written += spi_write_blocking(BME_SPI_PORT, data, len);
+	gpio_put(BME_CS_PIN, 1);
+	return (nb_written == (int)len + 1) ? BME68X_INTF_RET_SUCCESS : BME68X_E_COM_FAIL;
+}
+
+void bme_delay_us(uint32_t period, void* intf_ptr) {
+	sleep_us(period);
+}
+
+// Configures a chip select pin as an output, deselected
+void init_cs_pin(uint pin) {
+	gpio_init(pin);
+	gpio_put(pin, 1); // before setting the direction, to not select the device
+	gpio_set_dir(pin, GPIO_OUT);
+}
+
+// Must be called before radio.begin(): the BME680 listens in I2C until its CSB is first
+// pulled down, so it could take the SPI traffic of the radio as I2C (datasheet, 6.1)
+int8_t bme_setup() {
+	init_cs_pin(LORA_NSS_PIN); // keep the radio off the shared bus
+	init_cs_pin(BME_CS_PIN);
+	spi_init(BME_SPI_PORT, BME_SPI_SPEED_HZ); // SPI mode 0, MSB first
+	gpio_set_function(BME_MISO_PIN, GPIO_FUNC_SPI);
+	gpio_set_function(BME_SCK_PIN, GPIO_FUNC_SPI);
+	gpio_set_function(BME_MOSI_PIN, GPIO_FUNC_SPI);
+
+	bme.intf     = BME68X_SPI_INTF;
+	bme.read     = bme_spi_read;
+	bme.write    = bme_spi_write;
+	bme.delay_us = bme_delay_us;
+	bme.amb_temp = 25; // only used to compute the heater resistance
+	CHECK_BME(bme68x_init(&bme), "bme68x_init");
+
+	// Only measure temperature
+	bme_conf.os_temp = BME68X_OS_2X;
+	bme_conf.os_pres = BME68X_OS_NONE;
+	bme_conf.os_hum  = BME68X_OS_NONE;
+	bme_conf.filter  = BME68X_FILTER_OFF;
+	bme_conf.odr     = BME68X_ODR_NONE;
+	CHECK_BME(bme68x_set_conf(&bme_conf, &bme), "bme68x_set_conf");
+
+	// No gas measurement, heater off
+	struct bme68x_heatr_conf heatr_conf = {};
+	heatr_conf.enable = BME68X_DISABLE;
+	CHECK_BME(bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &bme), "bme68x_set_heatr_conf");
+	return BME68X_OK;
+}
+
+// Triggers a measurement and gets the temperature in hundredths of a degree Celsius
+int8_t read_bme_temperature(int32_t* temperature) {
+	struct bme68x_data data;
+	uint8_t n_fields;
+	// The sensor goes back to sleep by itself after a forced mode measurement
+	CHECK_BME(bme68x_set_op_mode(BME68X_FORCED_MODE, &bme), "bme68x_set_op_mode");
+	bme.delay_us(bme68x_get_meas_dur(BME68X_FORCED_MODE, &bme_conf, &bme), bme.intf_ptr);
+	CHECK_BME(bme68x_get_data(BME68X_FORCED_MODE, &data, &n_fields, &bme), "bme68x_get_data");
+	*temperature = lroundf(data.temperature * 100.0f);
+	return BME68X_OK;
 }
 
 int main() {
 	stdio_init_all();
 	sleep_ms(1000); // leave time for the USB serial to come up
 
-	adc_init();
-	adc_set_temp_sensor_enabled(true);
-	adc_select_input(ADC_TEMPERATURE_CHANNEL_NUM);
+	printf("[BME680] Initializing ... ");
+	if(bme_setup() != BME68X_OK) {
+		return 1;
+	}
+	printf("success!\n");
 
 	// Settings applied by begin(): reset, packet type LoRa, TCXO, DIO2 RF switch
 	radio.tcxoVoltage = LORA_TCXO_VOLTAGE;
@@ -164,9 +272,12 @@ int main() {
 
 	uint8_t buffer[PAYLOAD_LENGTH];
 	uint32_t nb_msg_sent = 0;
-	uint32_t temperature;
+	int32_t temperature;
 	while(1) {
-		temperature = read_chip_temperature();
+		if(read_bme_temperature(&temperature) != BME68X_OK) {
+			hal->delay(TX_PERIOD_MS);
+			continue;
+		}
 		// Little-endian, as decoded by the receiver
 		buffer[0] = temperature & 0xFF;
 		buffer[1] = (temperature >> 8) & 0xFF;
@@ -176,7 +287,7 @@ int main() {
 		int16_t state = radio.transmit(buffer, PAYLOAD_LENGTH);
 		if(state == RADIOLIB_ERR_NONE) {
 			nb_msg_sent += 1;
-			printf("sent %.2f, msg_sent: %lu\n", (int32_t)temperature / 100.0, (unsigned long)nb_msg_sent);
+			printf("sent %.2f, msg_sent: %lu\n", temperature / 100.0, (unsigned long)nb_msg_sent);
 		} else {
 			printf("transmit failed, code %d\n", state);
 		}

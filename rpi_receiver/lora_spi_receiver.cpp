@@ -155,7 +155,7 @@ int main() {
 				// Little-endian, as written by the sender
 				for(size_t i = 0; i + 4 <= len; i += 4) {
 					temperature = buffer[i] | (buffer[i + 1] << 8) | (buffer[i + 2] << 16) | ((uint32_t)buffer[i + 3] << 24);
-					printf("%.2f,", temperature / 100.0);
+					printf("%.2f,", (int32_t)temperature / 100.0);
 				}
 				printf("%" PRIu32 ",len=%zu,rssi=%.1f,snr=%.1f\n",
 				       nb_msg_received, len, radio.getRSSI(), radio.getSNR());

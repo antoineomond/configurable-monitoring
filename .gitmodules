@@ -9,3 +9,4 @@
 [submodule "external/BME68x_SensorAPI"]
 	path = external/BME68x_SensorAPI
 	url = https://github.com/boschsensortec/BME68x_SensorAPI
+	# pinned to 4.4.8

@@ -6,8 +6,9 @@
  The receiver is rpi_receiver/lora_spi_receiver.cpp (Pi Zero W). Both ends
  must use the same radio settings below.
 
- The payload is a 4-byte little-endian uint32_t holding the BME680 temperature
- in hundredths of a degree, which is what the receiver decodes (value / 100.0).
+ The payload holds the BME680 measurements as a sequence of 4-byte little-endian
+ integers, all in hundredths, which is what the receiver decodes (value / 100.0):
+   temperature (C), humidity (%), pressure (hPa), gas resistance (ohm, 0 if invalid)
 */
 
 #include <stdio.h>
@@ -87,6 +88,14 @@
 #define BME_MOSI_PIN LORA_MOSI_PIN
 #endif
 
+// Gas sensor heater, values from the quick start of the datasheet (3.2.1)
+#ifndef BME_HEATER_TEMP_C
+#define BME_HEATER_TEMP_C 300
+#endif
+#ifndef BME_HEATER_DURATION_MS
+#define BME_HEATER_DURATION_MS 100
+#endif
+
 // Radio configuration, must match the Pi Zero receiver
 #ifndef FREQ_HZ
 #define FREQ_HZ 920000000
@@ -127,9 +136,8 @@
 #define LORA_DIO2_AS_RF_SWITCH true
 #endif
 
-#ifndef PAYLOAD_LENGTH
-#define PAYLOAD_LENGTH 4
-#endif
+#define NB_MEASUREMENTS 4 // temperature, humidity, pressure, gas
+#define PAYLOAD_LENGTH (4 * NB_MEASUREMENTS)
 #ifndef TX_PERIOD_MS
 #define TX_PERIOD_MS 1000
 #endif
@@ -157,6 +165,7 @@ SX1262 radio = new Module(hal, LORA_NSS_PIN, LORA_DIO1_PIN, LORA_RESET_PIN, LORA
 
 struct bme68x_dev bme;
 struct bme68x_conf bme_conf;
+struct bme68x_heatr_conf bme_heatr_conf;
 
 // SPI callbacks for the BME68x_SensorAPI, which already sets the read/write bit of
 // reg_addr and, for writes, interleaves the next register addresses in data
@@ -204,30 +213,42 @@ int8_t bme_setup() {
 	bme.amb_temp = 25; // only used to compute the heater resistance
 	CHECK_BME(bme68x_init(&bme), "bme68x_init");
 
-	// Only measure temperature
+	// Oversampling values from the quick start of the datasheet (3.2.1)
 	bme_conf.os_temp = BME68X_OS_2X;
-	bme_conf.os_pres = BME68X_OS_NONE;
-	bme_conf.os_hum  = BME68X_OS_NONE;
+	bme_conf.os_pres = BME68X_OS_16X;
+	bme_conf.os_hum  = BME68X_OS_1X;
 	bme_conf.filter  = BME68X_FILTER_OFF;
 	bme_conf.odr     = BME68X_ODR_NONE;
 	CHECK_BME(bme68x_set_conf(&bme_conf, &bme), "bme68x_set_conf");
 
-	// No gas measurement, heater off
-	struct bme68x_heatr_conf heatr_conf = {};
-	heatr_conf.enable = BME68X_DISABLE;
-	CHECK_BME(bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &bme), "bme68x_set_heatr_conf");
+	bme_heatr_conf.enable     = BME68X_ENABLE;
+	bme_heatr_conf.heatr_temp = BME_HEATER_TEMP_C;
+	bme_heatr_conf.heatr_dur  = BME_HEATER_DURATION_MS;
+	CHECK_BME(bme68x_set_heatr_conf(BME68X_FORCED_MODE, &bme_heatr_conf, &bme), "bme68x_set_heatr_conf");
 	return BME68X_OK;
 }
 
-// Triggers a measurement and gets the temperature in hundredths of a degree Celsius
-int8_t read_bme_temperature(int32_t* temperature) {
+// Triggers a measurement and gets, in hundredths: temperature (C), humidity (%),
+// pressure (hPa) and gas resistance (ohm, 0 if invalid)
+int8_t read_bme_measurements(int32_t measurements[NB_MEASUREMENTS]) {
 	struct bme68x_data data;
 	uint8_t n_fields;
 	// The sensor goes back to sleep by itself after a forced mode measurement
 	CHECK_BME(bme68x_set_op_mode(BME68X_FORCED_MODE, &bme), "bme68x_set_op_mode");
-	bme.delay_us(bme68x_get_meas_dur(BME68X_FORCED_MODE, &bme_conf, &bme), bme.intf_ptr);
+	// The gas heating comes after the temperature, pressure and humidity measurements
+	bme.delay_us(bme68x_get_meas_dur(BME68X_FORCED_MODE, &bme_conf, &bme) + bme_heatr_conf.heatr_dur * 1000, bme.intf_ptr);
 	CHECK_BME(bme68x_get_data(BME68X_FORCED_MODE, &data, &n_fields, &bme), "bme68x_get_data");
-	*temperature = lroundf(data.temperature * 100.0f);
+
+	measurements[0] = lroundf(data.temperature * 100.0f);
+	measurements[1] = lroundf(data.humidity * 100.0f);
+	measurements[2] = lroundf(data.pressure); // Pa, i.e. hundredths of hPa
+	// The gas resistance is only meaningful if the heater reached its target temperature
+	if((data.status & BME68X_GASM_VALID_MSK) && (data.status & BME68X_HEAT_STAB_MSK)) {
+		measurements[3] = lroundf(data.gas_resistance * 100.0f); // below 14 Mohm, fits in 32 bits
+	} else {
+		printf("gas measurement invalid, status 0x%02x\n", data.status);
+		measurements[3] = 0;
+	}
 	return BME68X_OK;
 }
 
@@ -272,22 +293,26 @@ int main() {
 
 	uint8_t buffer[PAYLOAD_LENGTH];
 	uint32_t nb_msg_sent = 0;
-	int32_t temperature;
+	int32_t measurements[NB_MEASUREMENTS];
 	while(1) {
-		if(read_bme_temperature(&temperature) != BME68X_OK) {
+		if(read_bme_measurements(measurements) != BME68X_OK) {
 			hal->delay(TX_PERIOD_MS);
 			continue;
 		}
 		// Little-endian, as decoded by the receiver
-		buffer[0] = temperature & 0xFF;
-		buffer[1] = (temperature >> 8) & 0xFF;
-		buffer[2] = (temperature >> 16) & 0xFF;
-		buffer[3] = (temperature >> 24) & 0xFF;
+		for(int i = 0; i < NB_MEASUREMENTS; i += 1) {
+			buffer[4 * i]     = measurements[i] & 0xFF;
+			buffer[4 * i + 1] = (measurements[i] >> 8) & 0xFF;
+			buffer[4 * i + 2] = (measurements[i] >> 16) & 0xFF;
+			buffer[4 * i + 3] = (measurements[i] >> 24) & 0xFF;
+		}
 
 		int16_t state = radio.transmit(buffer, PAYLOAD_LENGTH);
 		if(state == RADIOLIB_ERR_NONE) {
 			nb_msg_sent += 1;
-			printf("sent %.2f, msg_sent: %lu\n", temperature / 100.0, (unsigned long)nb_msg_sent);
+			printf("sent %.2f C, %.2f %%, %.2f hPa, %.2f ohm, msg_sent: %lu\n",
+			       measurements[0] / 100.0, measurements[1] / 100.0, measurements[2] / 100.0,
+			       measurements[3] / 100.0, (unsigned long)nb_msg_sent);
 		} else {
 			printf("transmit failed, code %d\n", state);
 		}

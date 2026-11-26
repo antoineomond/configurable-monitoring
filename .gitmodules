@@ -10,3 +10,6 @@
 	path = external/BME68x_SensorAPI
 	url = https://github.com/boschsensortec/BME68x_SensorAPI
 	# pinned to 4.4.8
+[submodule "external/experiment-helpers"]
+	path = external/experiment-helpers
+	url = git@github.com:antoineomond/power-levels-experiment-helpers.git
